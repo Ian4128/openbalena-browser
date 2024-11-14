@@ -1,13 +1,24 @@
-version: '2'
-
-volumes:
-  settings:                          # Only required if using PERSISTENT flag (see below)
-
+version: "2"
 services:
-
   browser:
-    build: .
-    privileged: true # required for UDEV to find plugged in peripherals such as a USB mouse
-    network_mode: host
-    volumes:
-      - 'settings:/data' # Only required if using PERSISTENT flag (see below)
+    image: bh.cr/balenalabs/browser-${BALENA_ARCH}/2.7.0
+    privileged: true  # required for UDEV to find plugged in peripherals such as a USB mouse
+    restart: always
+    environment:
+      - KIOSK=1
+      - KIOSK_URL=http://dashing.local  # URL to your app or web page that uses Keycloak
+      - SHOW_CURSOR=0
+      - OIDC_ISSUER_URL= # Keycloak URL with realm
+      - OIDC_CLIENT_ID=  # Client ID registered in Keycloak
+      - OIDC_CLIENT_SECRET=  # Client secret for the client
+      - OIDC_REDIRECT_URI=http://dashing.local/callback  # Redirect URI configured in Keycloak
+      - OIDC_SCOPE=openid # Scopes to request from Keycloak
+
+  device-auth-server:
+    build: ./device-auth-server  # Location of the Node.js server code
+    environment:
+      - OIDC_ISSUER_URL=https://keycloak-server/auth/realms/myrealm
+      - OIDC_CLIENT_ID=myclient
+      - OIDC_CLIENT_SECRET=mysecret
+    ports:
+      - "3000:3000"
