@@ -22,3 +22,5 @@ services:
       - OIDC_CLIENT_SECRET=mysecret
     ports:
       - "3000:3000"
+
+      ### all env variables still need correct values
