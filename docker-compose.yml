@@ -1,7 +1,15 @@
 version: '2'
+services:
+  browser:
+    image: bh.cr/balenalabs/browser-$BALENA_ARCH/2.7.0
+    privileged: true # required for UDEV to find plugged in peripherals such as a USB mouse
+    restart: always
+    environment:
+      - KIOSK=1
+      - KIOSK_URL=http://dashing.local
+      - SHOW_CURSOR=0
 
-<<<<<<< HEAD
-  device-auth-server:
+device-auth-server:
     build: ./device-auth-server  # Location of the Node.js server code
     environment:
       - OIDC_ISSUER_URL=https://keycloak-server/auth/realms/myrealm
@@ -11,16 +19,3 @@ version: '2'
       - "3000:3000"
 
       ### all env variables still need correct values
-=======
-volumes:
-  settings:                          # Only required if using PERSISTENT flag (see below)
-
-services:
-
-  browser:
-    build: .
-    privileged: true # required for UDEV to find plugged in peripherals such as a USB mouse
-    network_mode: host
-    volumes:
-      - 'settings:/data' # Only required if using PERSISTENT flag (see below)
->>>>>>> parent of e8a16bd (Added new docker-composer.yml and server.js file)

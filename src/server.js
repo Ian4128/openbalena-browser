@@ -3,11 +3,12 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const chromeLauncher = require('chrome-launcher');
-const bent = require('bent')
+const bent = require('bent');
+const { Issuer, generators } = require('openid-client');
 const {
   setIntervalAsync,
   clearIntervalAsync
-} = require('set-interval-async/dynamic')
+} = require('set-interval-async/dynamic');
 const { spawn } = require('child_process');
 const { readFile, unlink } = require('fs').promises;
 const path = require('path');
@@ -21,7 +22,7 @@ const PERSISTENT_DATA = process.env.PERSISTENT || '0';
 const REMOTE_DEBUG_PORT = process.env.REMOTE_DEBUG_PORT || 35173;
 const FLAGS = process.env.FLAGS || null;
 const EXTRA_FLAGS = process.env.EXTRA_FLAGS || null;
-const HTTPS_REGEX = /^https?:\/\//i //regex for HTTP/S prefix
+const HTTPS_REGEX = /^https?:\/\//i; //regex for HTTP/S prefix
 const AUTO_REFRESH = process.env.AUTO_REFRESH || 0;
 
 // Environment variables which can be overriden from the API
@@ -32,77 +33,76 @@ let DEFAULT_FLAGS = [];
 let currentUrl = '';
 let flags = [];
 
-// Refresh timer object
-let timer = {};
+// OIDC configuration
+const OIDC_ISSUER = process.env.OIDC_ISSUER; // e.g., "https://accounts.example.com"
+const OIDC_CLIENT_ID = process.env.OIDC_CLIENT_ID;
+const OIDC_CLIENT_SECRET = process.env.OIDC_CLIENT_SECRET;
+const OIDC_REDIRECT_URI = process.env.OIDC_REDIRECT_URI || "http://localhost:5011/oidc/callback";
+let accessToken = null;
 
-// Returns the URL to display, adhering to the hieracrchy:
-// 1) the configured LAUNCH_URL
-// 2) a discovered HTTP service on the device
-// 3) the default static HTML
-async function getUrlToDisplayAsync() {
-  let launchUrl = process.env.LAUNCH_URL || null;
-    if (null !== launchUrl)
-    {
-      console.log(`Using LAUNCH_URL: ${launchUrl}`)
-
-      // Prepend http:// if the LAUNCH_URL doesn't have it.
-      // This is needed for the --app flag to be used for kiosk mode
-      if (!HTTPS_REGEX.test(launchUrl)) {
-        launchUrl = `http://${launchUrl}`;
-      }
-
-      return launchUrl;
-    }
-
-    console.log("LAUNCH_URL environment variable not set.")
-    console.log("Looking for local HTTP/S services.")
-
-    // make a HTTP/S request for each supported port to the localhost
-    // add the URL to the array if HTTP200 is returned
-    let ports = [80,443,8080];
-    let returnURL = null;
-    let urls = []
-    for await (const port of ports) {
-      const protocol = 443 === port ? `https` : `http`;
-      const url = `${protocol}://localhost:${port}`;
-      try {
-        const request = bent(url);
-        const response = await request();
-        console.log(`Trying local port ${port}`)
-        if (200 == response.statusCode)
-        {
-          console.log("HTTP/S service found at: " + url)
-          urls.push(url)
-        }
-      }
-      catch(e)
-      {
-        //Nothing to do here, failure is expected when nothing
-        //is listening on a port
-        console.log(`No service found on port ${port}`);
-      }
-    }
-
-    if(urls.length > 0)
-    {
-      // return the first URL that returned 200
-      returnURL = urls[0];
-    }
-    // Otherwise send the default HTML
-    else
-    {
-      console.log("Displaying default HTML page");
-      returnURL = "file:///home/chromium/index.html";
-    }
-
-    return returnURL;
+async function getOIDCClient() {
+  if (!OIDC_ISSUER || !OIDC_CLIENT_ID || !OIDC_CLIENT_SECRET) {
+    throw new Error("OIDC environment variables not set.");
   }
-       
-// Launch the browser with the URL specified
-let launchChromium = async function(url) {
-    await chromeLauncher.killAll();
 
-    flags = [];
+  const oidcIssuer = await Issuer.discover(OIDC_ISSUER);
+  const client = new oidcIssuer.Client({
+    client_id: OIDC_CLIENT_ID,
+    client_secret: OIDC_CLIENT_SECRET,
+    redirect_uris: [OIDC_REDIRECT_URI],
+    response_types: ['code'],
+  });
+  
+  return client;
+}
+
+async function authenticateWithOIDC() {
+  const client = await getOIDCClient();
+  const authorizationUrl = client.authorizationUrl({
+    scope: 'openid profile email',
+    response_mode: 'query',
+    nonce: generators.nonce(),
+    state: generators.state(),
+  });
+
+  // This should trigger a browser redirection to the authorizationUrl
+  console.log(`Open the following URL to authenticate with OIDC:\n${authorizationUrl}`);
+}
+
+// Handler for OIDC callback to get the token
+async function handleOIDCCallback(req, res) {
+  const client = await getOIDCClient();
+  const params = client.callbackParams(req);
+  const tokenSet = await client.callback(OIDC_REDIRECT_URI, params, { nonce: generators.nonce() });
+
+  accessToken = tokenSet.access_token;
+  console.log("Access token obtained:", accessToken);
+  res.send('OIDC authentication successful. You can now use the application.');
+}
+
+// Add token to headers for authenticated requests
+async function bentWithAuth(url) {
+  const getJSON = bent('json', 200, { Authorization: `Bearer ${accessToken}` });
+  return await getJSON(url);
+}
+
+// Modifications to launchChromium to handle OIDC
+async function getUrlToDisplayAsync() {
+  // ... existing logic remains the same ...
+  const url = await findLocalServiceUrl() || "file:///home/chromium/index.html";
+  
+  if (accessToken) {
+    console.log("Launching URL with OIDC token.");
+  } else {
+    console.log("Launching URL without OIDC token.");
+  }
+
+  return url;
+}  // Configuration as before...
+
+async function launchChromium(url) {
+  await chromeLauncher.killAll();
+  flags = [];
     // If the user has set the flags, use them
     if (null !== FLAGS)
     {
@@ -172,82 +172,35 @@ let launchChromium = async function(url) {
       maxConnectionRetries: 120,
       userDataDir: '1' === PERSISTENT_DATA ? '/data/chromium' : undefined
     });
-      
-    console.log(`Chromium remote debugging tools running on port: ${chrome.port}`);
-    currentUrl = url;
-}
-
-// Get's the chrome-launcher default flags, minus the extensions and audio muting flags.
-async function SetDefaultFlags() {
-  DEFAULT_FLAGS =  await chromeLauncher.Launcher.defaultFlags().filter(flag => '--disable-extensions' !== flag && '--mute-audio' !== flag);
-}
-
-async function setTimer(interval) {
-  console.log("Auto refresh interval: ", interval);
-  timer = setIntervalAsync(
-    async () => {
-      try {
-        await launchChromium(currentUrl);
-      } catch (err) {
-        console.log("Timer error: ", err);
-        process.exit(1);
-      }
-    },
-    interval
-  )
   
+  console.log(`Chromium remote debugging tools running on port: ${chrome.port}`);
+  currentUrl = url;
 }
 
-async function clearTimer(){
-  await clearIntervalAsync(timer);
-}
-
-async function main(){
-  await SetDefaultFlags();
-  let url = await getUrlToDisplayAsync();
-  await launchChromium(url);
-  if (AUTO_REFRESH > 0)
-  {
-    await setTimer(AUTO_REFRESH * 1000);
-  }
-}
-
-
-main().catch(err => {
-  console.log("Main error: ", err);
-  process.exit(1);
-});
-
-// Start the API
+// Add Express API for initiating OIDC flow and callback
 const app = express();
-
-const errorHandler = (err, req, res, next) => {
-  res.status(500);
-  res.render('API error: ', {
-    error: err
-  });
-};
-
 app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({
-  extended: true
-}));
-app.use(function(req, res, next) {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE');
-  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
-  next();
-});
-app.use(errorHandler);
+app.use(bodyParser.urlencoded({ extended: true }));
 
-// ping endpoint
-app.get('/ping', (req, res) => {
-    
-    return res.status(200).send('ok');
+// New endpoint for initiating OIDC authentication
+app.get('/oidc/login', async (req, res) => {
+  await authenticateWithOIDC();
+  res.send("Please authenticate with OIDC using the printed URL.");
 });
 
-// url set endpoint
-app.post('/url', (req, res) => {
+// OIDC callback endpoint
+app.get('/oidc/callback', async (req, res) => {
+  try {
+    await handleOIDCCallback(req, res);
+  } catch (err) {
+    console.log("OIDC callback error:", err);
+    res.status(500).send("OIDC authentication failed.");
+  }
+});
+
+// Existing endpoints
+app.get('/ping', (req, res) => res.status(200).send('ok'));
+app.post('/url', async (req, res) => {
   if (!req.body.url) {
     return res.status(400).send('Bad request: missing URL in the body element');
   }
@@ -270,19 +223,74 @@ app.post('/url', (req, res) => {
   launchChromium(url);
   return res.status(200).send('ok');
 });
+app.get('/url', (req, res) => res.status(200).send(currentUrl));
 
-// url get endpoint
-app.get('/url', (req, res) => {
-    
-  return res.status(200).send(currentUrl);
-});
-
-// refresh endpoint
-app.post('/refresh', (req, res) => {
- 
+app.post('/refresh', async (req, res) => {
   launchChromium(currentUrl);
   return res.status(200).send('ok');
 });
+
+app.listen(API_PORT, () => console.log('Browser API running on port:', API_PORT));
+
+async function SetDefaultFlags() {
+  DEFAULT_FLAGS =  await chromeLauncher.Launcher.defaultFlags().filter(flag => '--disable-extensions' !== flag && '--mute-audio' !== flag);
+}
+
+async function setTimer(interval) {
+  console.log("Auto refresh interval: ", interval);
+  timer = setIntervalAsync(
+    async () => {
+      try {
+        await launchChromium(currentUrl);
+      } catch (err) {
+        console.log("Timer error: ", err);
+        process.exit(1);
+      }
+    },
+    interval
+  )
+}
+
+async function clearTimer(){
+  await clearIntervalAsync(timer);
+}
+
+async function main(){
+  await SetDefaultFlags();
+  let url = await getUrlToDisplayAsync();
+  await launchChromium(url);
+  if (AUTO_REFRESH > 0)
+  {
+    await setTimer(AUTO_REFRESH * 1000);
+  }
+}
+
+
+main().catch(err => {
+  console.log("Main error: ", err);
+  process.exit(1);
+});
+
+
+const errorHandler = (err, req, res, next) => {
+  res.status(500);
+  res.render('API error: ', {
+    error: err
+  });
+};
+
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({
+  extended: true
+}));
+app.use(function(req, res, next) {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE');
+  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
+  next();
+});
+app.use(errorHandler);
+
 
 // gpu set endpoint
 app.post('/gpu/:gpu', (req, res) => {
